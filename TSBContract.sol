@@ -259,6 +259,15 @@ contract TSBToken is ERC20, NamedOwnedToken {
         return true;
     }
 
+    /**
+     * Delete tokens tokens during the end of croudfunding 
+     * (in case of errors made by crowdfnuding participants)
+     * Only owner could call
+     */
+    function deleteTokens(address adr, uint256 amount) public onlyOwner canMint {
+        burnTo(amount, adr);
+    }
+
 	bool public mintingFinished = false;
 	event Mint(address indexed to, uint256 amount);
 	event MintFinished();
@@ -311,7 +320,7 @@ contract TSBToken is ERC20, NamedOwnedToken {
      * Owner could initiate a withdrawal of accrued dividends and coupons to some address (in purpose to help users)
      */
 	function WithdrawDividendsAndCouponsTo(address _sendadr) public onlyOwner {
-		withdrawTo(_sendadr,tx.gasprice);
+		withdrawTo(_sendadr, tx.gasprice * block.gaslimit);
 	}
 
     /**
@@ -380,27 +389,29 @@ contract TSBToken is ERC20, NamedOwnedToken {
     * Sell tokens after 2 weeks from information
     */
 	function doRebuy() public {
-		_doRebuyTo(msg.sender);
+		_doRebuyTo(msg.sender, 0);
 	}
     /**
     * Contract owner would perform tokens rebuy after 2 weeks from information
     */
 	function doRebuyTo(address adr) public onlyOwner {
-		_doRebuyTo(adr);
+		_doRebuyTo(adr, tx.gasprice * block.gaslimit);
 	}
-	function _doRebuyTo(address adr) internal {
+	function _doRebuyTo(address adr, uint comiss) internal {
 		require (rebuyStarted || (now >= startRebuyTime));
 		require (now >= rebuyInformTime[adr].add(14 days));
 		uint sum = rebuySum[adr];
 		require (sum <= balances[adr]);
+		withdrawTo(adr, 0);
 		if (burnTo(sum, adr)) {
 			sum = sum.div(tokenDecimals);
 			sum = sum.mul(tokenPriceETH);
-			adr.transfer(sum.div(tokenDecimalsLeft));
+			sum = sum.div(tokenDecimalsLeft);
+			sum = sum.sub(comiss);
+			adr.transfer(sum);
 			rebuySum[adr] = 0;
 		}
 	}
-
 
 }
 
@@ -409,7 +420,7 @@ contract TSBCrowdFundingContract is NamedOwnedToken{
 
 
 	enum CrowdSaleState {NotFinished, Success, Failure}
-	CrowdSaleState crowdSaleState = CrowdSaleState.NotFinished;
+	CrowdSaleState public crowdSaleState = CrowdSaleState.NotFinished;
 
 
     uint public fundingGoalUSD = 200000; //Min cap
@@ -466,12 +477,16 @@ contract TSBCrowdFundingContract is NamedOwnedToken{
         string tokenName,
         string tokenSymbol
 	) NamedOwnedToken(tokenName, tokenSymbol) public {
-		require(_startTime >= now);
-		startTime = _startTime;
-		bonusEndTime = startTime + 24 hours;
-        endTime = startTime + (durationInHours * 1 hours);
+	//	require(_startTime >= now);
+	    SetStartTime(_startTime, durationInHours);
 		bonusCapUSD = bonusCapUSD * USDDecimals;
 	}
+
+    function SetStartTime(uint startT, uint durationInHours) public onlyOwner {
+        startTime = startT;
+        bonusEndTime = startT+ 24 hours;
+        endTime = startT + (durationInHours * 1 hours);
+    }
 
 	function assignTokenContract(address tok) public onlyOwner   {
 		tokenReward = TSBToken(tok);
@@ -482,7 +497,13 @@ contract TSBCrowdFundingContract is NamedOwnedToken{
 		bool withinPeriod = now >= startTime && now <= endTime;
 		bool nonZeroPurchase = msg.value != 0;
 		require( withinPeriod && nonZeroPurchase && (crowdSaleState == CrowdSaleState.NotFinished));
-		ReceiveAmount(msg.sender, msg.value, 0, now);
+		uint bonuspos = 0;
+		if (now <= bonusEndTime) {
+//		    lastdata = msg.data;
+			bytes32 code = sha3(msg.data);
+			bonuspos = bonusesMapPos[code];
+		}
+		ReceiveAmount(msg.sender, msg.value, 0, now, bonuspos);
 
 	}
 
@@ -490,6 +511,14 @@ contract TSBCrowdFundingContract is NamedOwnedToken{
 		return true;
 	}
 
+	function AddBTCTransactionFromArray (address[] ETHadress, uint[] BTCnum, uint[] TransTime, bytes4[] bonusdata) public onlyOwner {
+        require(ETHadress.length == BTCnum.length); 
+        require(TransTime.length == bonusdata.length);
+        require(ETHadress.length == bonusdata.length);
+        for (uint i = 0; i < ETHadress.length; i++) {
+            AddBTCTransaction(ETHadress[i], BTCnum[i], TransTime[i], bonusdata[i]);
+        }
+	}
     /**
      * Add transfered BTC, only owner could call
      *
@@ -497,11 +526,17 @@ contract TSBCrowdFundingContract is NamedOwnedToken{
      * @param BTCnum the received amount in BTC * 10^18
      * @param TransTime the original (BTC) transaction time
      */
-	function AddBTCTransaction (address ETHadress, uint BTCnum, uint TransTime) public onlyOwner {
+	function AddBTCTransaction (address ETHadress, uint BTCnum, uint TransTime, bytes4 bonusdata) public onlyOwner {
 		require(CheckBTCtransaction());
 		require((TransTime >= startTime) && (TransTime <= endTime));
 		require(BTCnum != 0);
-		ReceiveAmount(ETHadress, 0, BTCnum, TransTime);
+		uint bonuspos = 0;
+		if (TransTime <= bonusEndTime) {
+//		    lastdata = bonusdata;
+			bytes32 code = sha3(bonusdata);
+			bonuspos = bonusesMapPos[code];
+		}
+		ReceiveAmount(ETHadress, 0, BTCnum, TransTime, bonuspos);
 	}
 
 	modifier afterDeadline() { if (now >= endTime) _; }
@@ -562,12 +597,12 @@ contract TSBCrowdFundingContract is NamedOwnedToken{
         }
     }
 
-	function ReceiveAmount(address investor, uint sumETH, uint sumBTC, uint TransTime) internal {
+	function ReceiveAmount(address investor, uint sumETH, uint sumBTC, uint TransTime, uint bonuspos) internal {
 		require(investor != 0x0);
 
 		uint pos = balanceMapPos[investor];
 		if (pos>0) {
-			pos -= 1;
+			pos--;
 			assert(pos < balanceList.length);
 			assert(balanceList[pos].mapAddress == investor);
 			balanceList[pos].mapBalanceETH = balanceList[pos].mapBalanceETH.add(sumETH);
@@ -580,70 +615,52 @@ contract TSBCrowdFundingContract is NamedOwnedToken{
 			newStruct.bonusTokens = 0;
 			pos = balanceList.push(newStruct);		
 			balanceMapPos[investor] = pos;
-			
+			pos--;
 		}
 		
 		// update state
 		ETHCollected = ETHCollected.add(sumETH);
 		BTCCollected = BTCCollected.add(sumBTC);
-		checkBonus(pos, sumETH, sumBTC, TransTime);
+		
+		checkBonus(pos, sumETH, sumBTC, TransTime, bonuspos);
 		checkMaxCapReached();
 	}
 
-    /**
-     * Distribute tokens to all participants, only owner could call
-     */
-	function DistributeAllTokens() public payable onlyOwner {
-		DistributeTokens(0, balanceList.length-1);
-		finishDistribution();
-	}
-
-	uint DistributionNextPos = 0;
+	uint public DistributionNextPos = 0;
 
     /**
      * Distribute tokens to next N participants, only owner could call
      */
-	function DistributeNextTokens(uint n) public payable onlyOwner {
-		uint nextpos = DistributionNextPos.add(n);
-		DistributeTokens(DistributionNextPos, nextpos);
-		DistributionNextPos = nextpos;
-		if (DistributionNextPos >= balanceList.length) {
-			finishDistribution();
-		}
-	}
-
-	function finishDistribution()  internal {
-// 		if (ETHSumToDistribute>0) {
-// 			if (owner.send(ETHSumToDistribute)) {
-// 				FundTransfer(owner, ETHSumToDistribute, false);
-// 			} 
-// 		}
-		if (TokenAmountToPay == 0) {
-			tokenReward.finishMinting();
-		}
-		tokenReward.transferOwnership(owner);
-	//	selfdestruct(owner);
-	}
-
-	function DistributeTokens(uint start, uint end) internal {
-		require(start<balanceList.length);
-		require(balanceList.length>0);
-		require(crowdSaleState == CrowdSaleState.Success);
+	function DistributeNextNTokens(uint n) public payable onlyOwner {
 		require(BonusesDistributed);
-		if ((end > balanceList.length) || (end==0)) {
-			end = balanceList.length;
+		require(DistributionNextPos<balanceList.length);
+		uint nextpos;
+		if (n == 0) {
+		    nextpos = balanceList.length;
+		} else {
+    		nextpos = DistributionNextPos.add(n);
+    		if (nextpos > balanceList.length) {
+    			nextpos = balanceList.length;
+    		}
 		}
-
-//		uint ETHSumToDistribute = 0;
-		for (uint i = start; i < end; i++) {
+		uint TokenAmountToPay_local = TokenAmountToPay;
+		for (uint i = DistributionNextPos; i < nextpos; i++) {
 			uint USDbalance = convertToUSD(balanceList[i].mapBalanceETH, balanceList[i].mapBalanceBTC);
-//			ETHSumToDistribute = ETHSumToDistribute.add(balanceList[i].mapBalanceETH);
 			uint tokensCount = USDbalance.mul(priceUSD);
 			tokenReward.mintToken(balanceList[i].mapAddress, tokensCount + balanceList[i].bonusTokens);
-			TokenAmountToPay = TokenAmountToPay.sub(tokensCount);
+			TokenAmountToPay_local = TokenAmountToPay_local.sub(tokensCount);
 			balanceList[i].mapBalanceETH = 0;
 			balanceList[i].mapBalanceBTC = 0;
 		}
+		TokenAmountToPay = TokenAmountToPay_local;
+		DistributionNextPos = nextpos;
+	}
+
+	function finishDistribution()  onlyOwner {
+		require ((TokenAmountToPay == 0)||(DistributionNextPos >= balanceList.length));
+//		tokenReward.finishMinting();
+		tokenReward.transferOwnership(owner);
+		selfdestruct(owner);
 	}
 
     /**
@@ -678,6 +695,16 @@ contract TSBCrowdFundingContract is NamedOwnedToken{
     /**
      * Add a new bonus code, only owner could call
      */
+	function AddBonusToListFromArray(bytes32[] bonusCode, uint[] ETHsumInFinney, uint[] BTCsumInFinney) public onlyOwner {
+	    require(bonusCode.length == ETHsumInFinney.length);
+	    require(bonusCode.length == BTCsumInFinney.length);
+	    for (uint i = 0; i < bonusCode.length; i++) {
+	        AddBonusToList(bonusCode[i], ETHsumInFinney[i], BTCsumInFinney[i] );
+	    }
+	}
+    /**
+     * Add a new bonus code, only owner could call
+     */
 	function AddBonusToList(bytes32 bonusCode, uint ETHsumInFinney, uint BTCsumInFinney) public onlyOwner {
 		uint pos = bonusesMapPos[bonusCode];
 
@@ -700,13 +727,10 @@ contract TSBCrowdFundingContract is NamedOwnedToken{
 	}
 	bool public BonusesDistributed = false;
 	uint public BonusCalcPos = 0;
-
-	function checkBonus(uint newBalancePos, uint sumETH, uint sumBTC, uint TransTime) internal {
-		if (TransTime <= bonusEndTime) {
-			bytes32 code = sha3(msg.data);
-			uint pos = bonusesMapPos[code];
+//    bytes public lastdata;
+	function checkBonus(uint newBalancePos, uint sumETH, uint sumBTC, uint TransTime, uint pos) internal {
 			if (pos > 0) {
-				pos -= 1;
+				pos--;
 				if (!bonusesList[pos].notempty) {
 					bonusesList[pos].balancePos = newBalancePos;
 					bonusesList[pos].notempty = true;
@@ -714,20 +738,12 @@ contract TSBCrowdFundingContract is NamedOwnedToken{
 				    if (bonusesList[pos].balancePos != newBalancePos) return;
 				}
 				bonusesList[pos].bonusETH = bonusesList[pos].bonusETH.add(sumETH);
-				if (bonusesList[pos].bonusETH > bonusesList[pos].maxBonusETH)
-					bonusesList[pos].bonusETH = bonusesList[pos].maxBonusETH;
+				// if (bonusesList[pos].bonusETH > bonusesList[pos].maxBonusETH)
+				// 	bonusesList[pos].bonusETH = bonusesList[pos].maxBonusETH;
 				bonusesList[pos].bonusBTC = bonusesList[pos].bonusBTC.add(sumBTC);
-				if (bonusesList[pos].bonusBTC > bonusesList[pos].maxBonusBTC)
-					bonusesList[pos].bonusETH = bonusesList[pos].maxBonusBTC;
+				// if (bonusesList[pos].bonusBTC > bonusesList[pos].maxBonusBTC)
+				// 	bonusesList[pos].bonusBTC = bonusesList[pos].maxBonusBTC;
 			}
-		}
-	}
-
-    /**
-     * Calc the number of bonus tokens for all bonus participants, only owner could call
-     */
-	function calcAllBonuses() public onlyOwner {
-		calcNextNBonuses(bonusesList.length);
 	}
 
     /**
@@ -736,29 +752,32 @@ contract TSBCrowdFundingContract is NamedOwnedToken{
 	function calcNextNBonuses(uint N) public onlyOwner {
 		require(crowdSaleState == CrowdSaleState.Success);
 		require(!BonusesDistributed);
-		uint nextPos = BonusCalcPos.add(N);
+		uint nextPos = BonusCalcPos + N;
 		if (nextPos > bonusesList.length) 
 			nextPos = bonusesList.length;
-
+        uint bonusCapUSD_local = bonusCapUSD;    
 		for (uint i = BonusCalcPos; i < nextPos; i++) {
 			if  ((bonusesList[i].notempty) && (bonusesList[i].balancePos < balanceList.length)) {
+				uint maxbonus = convertToUSD(bonusesList[i].maxBonusETH, bonusesList[i].maxBonusBTC);
 				uint bonus = convertToUSD(bonusesList[i].bonusETH, bonusesList[i].bonusBTC);
+				if (maxbonus < bonus)
+				    bonus = maxbonus;
 				bonus = bonus.mul(priceUSD);
-				if (bonusCapUSD >= bonus) {
-					bonusCapUSD = bonusCapUSD.sub(bonus);
+				if (bonusCapUSD_local >= bonus) {
+					bonusCapUSD_local = bonusCapUSD_local - bonus;
 				} else {
-					bonus = bonusCapUSD;
-					bonusCapUSD = 0;
+					bonus = bonusCapUSD_local;
+					bonusCapUSD_local = 0;
 				}
-				bonus = bonus.mul(bonusesList[i].bonusPercent);
-				bonus = bonus.div(100);
+				bonus = bonus.mul(bonusesList[i].bonusPercent) / 100;
 				balanceList[bonusesList[i].balancePos].bonusTokens = bonus;
-				if (bonusCapUSD == 0) {
+				if (bonusCapUSD_local == 0) {
 					BonusesDistributed = true;
 					break;
 				}
 			}
 		}
+        bonusCapUSD = bonusCapUSD_local;    
 		BonusCalcPos = nextPos;
 		if (nextPos >= bonusesList.length) {
 			BonusesDistributed = true;
