@@ -1,2 +1,2 @@
 # Contract
-TensorBox token smart contract. Version 0.9
+TensorBox token smart contract. Version 1.0
